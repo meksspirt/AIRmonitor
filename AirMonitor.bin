@@ -1,0 +1,208 @@
+esphome:
+  name: air-monitor
+  friendly_name: Air Monitor
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+api:
+  encryption:
+    key:
+
+ota:
+  - platform: esphome
+    password: 
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: 
+    password: 
+
+captive_portal:
+
+logger:
+  level: DEBUG
+
+i2c:
+  sda: 20
+  scl: 19
+  scan: true
+  id: bus_a
+  frequency: 50kHz
+ 
+globals:
+  - id: aqi_filtered
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+
+  - id: aqi_last
+    type: int
+    restore_value: no
+    initial_value: '1'
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+number:
+  - platform: template
+    name: "FRC Target CO2"
+    id: frc_target
+    min_value: 400
+    max_value: 2000
+    step: 1
+    initial_value: 426
+    unit_of_measurement: "ppm"
+    optimistic: true
+    restore_value: true
+
+sensor:
+  # 1. BMP280 - должен быть объявлен ДО scd4x, чтобы id был доступен
+  - platform: bmp280_i2c
+    address: 0x77
+    pressure:
+      name: "BMP280 Pressure"
+      id: bmp_pressure # ID для привязки к SCD40
+    temperature:
+      name: "BMP280 Temperature"
+    update_interval: 15s
+
+  # 2. SCD40 с динамической компенсацией давления
+  - platform: scd4x
+    id: scd40_id
+    # Привязка источника давления для наилучшей точности
+    ambient_pressure_compensation_source: bmp_pressure 
+    co2:
+      name: "SCD40 CO2"
+      id: scd40_co2_val
+    temperature:
+      name: "SCD40 Temperature"
+    humidity:
+      name: "SCD40 Humidity"
+    update_interval: 10s
+
+  # 3. VEML7700
+  - platform: veml7700
+    ambient_light:
+      name: "Ambient Light"
+    update_interval: 60s
+
+  - platform: aht10
+    variant: AHT20
+    temperature:
+      name: "AHT20 Temperature"
+      id: aht20_temp
+    humidity:
+      name: "AHT20 Humidity"
+      id: aht20_hum
+    update_interval: 10s
+
+  # 5. ENS160 (Исправлены ID компенсации)
+  - platform: ens160_i2c
+    address: 0x53
+    eco2:
+      name: "ENS160 eCO2"
+    tvoc:
+      name: "ENS160 TVOC"
+    aqi:
+      id: ens160_air_quality_index
+      name: "ENS160 Air Quality Index"
+    compensation:
+      temperature: aht20_temp
+      humidity: aht20_hum
+  - platform: template
+    name: "Real Air Quality PRO"
+    id: real_aqi_pro
+    unit_of_measurement: "index"
+    update_interval: 10s
+    lambda: |-
+
+      // --- CO2 ---
+      float co2 = id(scd40_co2_val).state;
+      int co2_score;
+
+      if (co2 < 800) co2_score = 1;
+      else if (co2 < 1200) co2_score = 2;
+      else if (co2 < 1600) co2_score = 3;
+      else if (co2 < 2000) co2_score = 4;
+      else co2_score = 5;
+
+      // --- VOC (ENS160) ---
+      int voc_score = (int) id(ens160_air_quality_index).state;
+
+      // --- День / ночь ---
+      auto now = id(homeassistant_time).now();
+      bool is_night = (now.hour < 7 || now.hour >= 23);
+
+      float w_co2 = is_night ? 0.7 : 0.5;
+      float w_voc = is_night ? 0.3 : 0.5;
+
+      float raw = (co2_score * w_co2) + (voc_score * w_voc);
+
+      // --- EMA сглаживание ---
+      float alpha = 0.3;
+      id(aqi_filtered) = alpha * raw + (1 - alpha) * id(aqi_filtered);
+
+      // --- Округление ---
+      int rounded = round(id(aqi_filtered));
+
+      // --- Гистерезис ---
+      if (abs(rounded - id(aqi_last)) >= 2) {
+        id(aqi_last) = rounded;
+      }
+
+      return id(aqi_last);
+
+
+button:
+  - platform: template
+    name: "Perform SCD40 Forced Recalibration"
+    icon: "mdi:target-variant"
+    on_press:
+      then:
+        - logger.log: "Starting FRC using native action..."
+        - scd4x.perform_forced_calibration:
+            id: scd40_id
+            value: !lambda "return id(frc_target).state;"
+
+
+text_sensor:
+  - platform: template
+    name: "ENS160 Air Quality Rating"
+    id: ens160_rating
+    icon: "mdi:air-filter"
+    lambda: |-
+      // Проверка на прогрев или отсутствие данных
+      if (std::isnan(id(ens160_air_quality_index).state)) {
+        return {"Initializing/Warming up..."};
+      }
+      
+      // Маппинг индекса в текст
+      switch ( (int)id(ens160_air_quality_index).state ) {
+        case 1: return {"Excellent"};
+        case 2: return {"Good"};
+        case 3: return {"Moderate"};
+        case 4: return {"Poor"};
+        case 5: return {"Unhealthy"};
+        default: return {"Not Available"};
+      }
+    update_interval: 60s
+  - platform: template
+    name: "Air Quality PRO Status"
+    lambda: |-
+      int v = (int) id(real_aqi_pro).state;
+
+      switch (v) {
+        case 1: return {"🟢 Excellent"};
+        case 2: return {"🟡 Good"};
+        case 3: return {"🟠 Moderate"};
+        case 4: return {"🔴 Poor"};
+        case 5: return {"☠️ Unhealthy"};
+        default: return {"Unknown"};
+      }
