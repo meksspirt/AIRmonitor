@@ -105,7 +105,6 @@ sensor:
 
   # 5. ENS160 (Исправлены ID компенсации)
   - platform: ens160_i2c
-    address: 0x53
     eco2:
       name: "ENS160 eCO2"
     tvoc:
